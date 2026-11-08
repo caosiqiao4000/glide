@@ -1,0 +1,224 @@
+package com.bumptech.glide.load.resource.bitmap;
+
+import static com.google.common.truth.Truth.assertThat;
+
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.content.Context;
+import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.net.Uri;
+import android.os.Build;
+import android.provider.MediaStore;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.test.core.app.ApplicationProvider;
+import androidx.test.ext.junit.runners.AndroidJUnit4;
+import com.bumptech.glide.load.Options;
+import com.bumptech.glide.load.engine.Resource;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.robolectric.Robolectric;
+import org.robolectric.annotation.Config;
+
+@RunWith(AndroidJUnit4.class)
+@Config(sdk = Build.VERSION_CODES.VANILLA_ICE_CREAM)
+public final class UriBitmapImageDecoderResourceDecoderTest {
+
+  private Context context;
+  private UriBitmapImageDecoderResourceDecoder decoder;
+  private Options options;
+
+  @Before
+  public void setUp() {
+    context = ApplicationProvider.getApplicationContext();
+    decoder = new UriBitmapImageDecoderResourceDecoder(context);
+    options = new Options();
+  }
+
+  @Test
+  @Config(sdk = Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+  public void handles_onSdkLessThanVanillaIceCream_returnsFalse() throws IOException {
+    Uri uri = Uri.parse("file:///path/to/image.png");
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_returnsTrueForUri() throws IOException {
+    ContentValues values = new ContentValues();
+    values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+    Uri uri =
+        context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+    assertThat(decoder.handles(uri, options)).isTrue();
+  }
+
+  @Test
+  public void decode_withNonExistentUri_returnsNull() throws IOException {
+    Uri uri = Uri.parse("file:///non-existent-file.png");
+    assertThat(decoder.decode(uri, /* width= */ 100, /* height= */ 100, options)).isNull();
+  }
+
+  @Test
+  public void handles_returnsTrueForFileUri() throws IOException {
+    Uri uri = Uri.parse("file:///path/to/image.png");
+    assertThat(decoder.handles(uri, options)).isTrue();
+  }
+
+  @Test
+  public void handles_returnsTrueForResourceUri() throws IOException {
+    Uri uri = Uri.parse("android.resource://com.bumptech.glide.test/raw/image");
+    assertThat(decoder.handles(uri, options)).isTrue();
+  }
+
+  @Test
+  public void handles_returnsFalseForHttpUri() throws IOException {
+    Uri uri = Uri.parse("http://example.com/image.png");
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_returnsFalseForGifUri() throws IOException {
+    ContentValues values = new ContentValues();
+    values.put(MediaStore.Images.Media.MIME_TYPE, "image/gif");
+    Uri uri =
+        context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_withTargetFrameOption_returnsFalse() throws IOException {
+    Uri uri = Uri.parse("file:///path/to/image.png");
+    options.set(VideoDecoder.TARGET_FRAME, 1000L);
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void decode_solidColor_returnsExactColor() throws IOException {
+    Bitmap bmp = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888);
+    Canvas canvas = new Canvas(bmp);
+    canvas.drawColor(Color.RED);
+
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    bmp.compress(Bitmap.CompressFormat.PNG, 0, out);
+
+    ContentValues values = new ContentValues();
+    values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+    Uri uri =
+        context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+
+    try (OutputStream os = context.getContentResolver().openOutputStream(uri)) {
+      out.writeTo(os);
+    }
+
+    Resource<Bitmap> resource = decoder.decode(uri, /* width= */ 100, /* height= */ 100, options);
+    Bitmap decoded = resource.get();
+
+    assertThat(decoded.getPixel(0, 0)).isEqualTo(Color.RED);
+  }
+
+  @Test
+  public void handles_returnsFalseForVideoUri() throws IOException {
+    ContentValues values = new ContentValues();
+    values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+    Uri uri =
+        context.getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_returnsFalseForVideoFileUri() throws IOException {
+    Uri uri = Uri.parse("file:///path/to/video.mp4");
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_returnsFalseForTextUri() throws IOException {
+    ContentValues values = new ContentValues();
+    values.put(MediaStore.Files.FileColumns.MIME_TYPE, "text/plain");
+    Uri uri =
+        context.getContentResolver().insert(MediaStore.Files.getContentUri("external"), values);
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_returnsFalseForUnknownExtensionFileUri() throws IOException {
+    Uri uri = Uri.parse("file:///path/to/file.unknown");
+    assertThat(decoder.handles(uri, options)).isFalse();
+  }
+
+  @Test
+  public void handles_contentUriWithImageExtension_usesExtensionWithoutQueryingProvider()
+      throws IOException {
+    Robolectric.setupContentProvider(CountingVideoContentProvider.class, FAKE_AUTHORITY);
+    Uri uri = Uri.parse("content://" + FAKE_AUTHORITY + "/12345.jpg");
+
+    assertThat(decoder.handles(uri, options)).isTrue();
+    assertThat(CountingVideoContentProvider.getTypeCalls).isEqualTo(0);
+  }
+
+  @Test
+  public void handles_contentUriWithoutExtension_fallsBackToProviderType() throws IOException {
+    Robolectric.setupContentProvider(CountingVideoContentProvider.class, FAKE_AUTHORITY);
+    Uri uri = Uri.parse("content://" + FAKE_AUTHORITY + "/12345");
+
+    assertThat(decoder.handles(uri, options)).isFalse();
+    assertThat(CountingVideoContentProvider.getTypeCalls).isEqualTo(1);
+  }
+
+  private static final String FAKE_AUTHORITY = "com.bumptech.glide.test.fake";
+
+  public static final class CountingVideoContentProvider extends ContentProvider {
+    static int getTypeCalls;
+
+    @Override
+    public boolean onCreate() {
+      getTypeCalls = 0;
+      return true;
+    }
+
+    @Nullable
+    @Override
+    public String getType(@NonNull Uri uri) {
+      getTypeCalls++;
+      return "video/mp4";
+    }
+
+    @Nullable
+    @Override
+    public Cursor query(
+        @NonNull Uri uri,
+        @Nullable String[] projection,
+        @Nullable String selection,
+        @Nullable String[] selectionArgs,
+        @Nullable String sortOrder) {
+      return null;
+    }
+
+    @Nullable
+    @Override
+    public Uri insert(@NonNull Uri uri, @Nullable ContentValues values) {
+      return null;
+    }
+
+    @Override
+    public int delete(
+        @NonNull Uri uri, @Nullable String selection, @Nullable String[] selectionArgs) {
+      return 0;
+    }
+
+    @Override
+    public int update(
+        @NonNull Uri uri,
+        @Nullable ContentValues values,
+        @Nullable String selection,
+        @Nullable String[] selectionArgs) {
+      return 0;
+    }
+  }
+}

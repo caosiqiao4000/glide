@@ -5,6 +5,7 @@ import android.graphics.ImageDecoder;
 import android.graphics.ImageDecoder.Source;
 import android.util.Log;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import com.bumptech.glide.load.Options;
 import com.bumptech.glide.load.ResourceDecoder;
@@ -19,33 +20,56 @@ import java.io.IOException;
 public final class BitmapImageDecoderResourceDecoder implements ResourceDecoder<Source, Bitmap> {
   private static final String TAG = "BitmapImageDecoder";
   private final BitmapPool bitmapPool = new BitmapPoolAdapter();
+  private final boolean floorTargetSizeToOnePixel;
 
-  @Override
-  public boolean handles(@NonNull Source source, @NonNull Options options) throws IOException {
-    return true;
+  public BitmapImageDecoderResourceDecoder() {
+    this(/* floorTargetSizeToOnePixel= */ false);
+  }
+
+  /**
+   * See {@link DefaultOnHeaderDecodedListener#DefaultOnHeaderDecodedListener(int, int, Options,
+   * boolean)}.
+   */
+  public BitmapImageDecoderResourceDecoder(boolean floorTargetSizeToOnePixel) {
+    this.floorTargetSizeToOnePixel = floorTargetSizeToOnePixel;
   }
 
   @Override
+  public boolean handles(@NonNull Source source, @NonNull Options options) {
+    return true;
+  }
+
+  @Nullable
+  @Override
   public Resource<Bitmap> decode(
-      @NonNull Source source, int width, int height, @NonNull Options options) throws IOException {
-    Bitmap result =
-        ImageDecoder.decodeBitmap(
-            source, new DefaultOnHeaderDecodedListener(width, height, options));
-    if (Log.isLoggable(TAG, Log.VERBOSE)) {
-      Log.v(
-          TAG,
-          "Decoded"
-              + " ["
-              + result.getWidth()
-              + "x"
-              + result.getHeight()
-              + "]"
-              + " for ["
-              + width
-              + "x"
-              + height
-              + "]");
+      @NonNull Source source, int width, int height, @NonNull Options options) {
+    try {
+      Bitmap result =
+          ImageDecoder.decodeBitmap(
+              source,
+              new DefaultOnHeaderDecodedListener(
+                  width, height, options, floorTargetSizeToOnePixel));
+      if (Log.isLoggable(TAG, Log.VERBOSE)) {
+        Log.v(
+            TAG,
+            "Decoded"
+                + " ["
+                + result.getWidth()
+                + "x"
+                + result.getHeight()
+                + "]"
+                + " for ["
+                + width
+                + "x"
+                + height
+                + "]");
+      }
+      return new BitmapResource(result, bitmapPool);
+    } catch (IOException e) {
+      if (Log.isLoggable(TAG, Log.DEBUG)) {
+        Log.d(TAG, "Failed to decode bitmap from ImageDecoder source", e);
+      }
+      return null;
     }
-    return new BitmapResource(result, bitmapPool);
   }
 }

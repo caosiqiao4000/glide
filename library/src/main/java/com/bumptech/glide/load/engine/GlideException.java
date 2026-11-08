@@ -14,7 +14,9 @@ import java.util.List;
 
 /** An exception with zero or more causes indicating why a load in Glide failed. */
 // Public API.
-@SuppressWarnings("WeakerAccess")
+// Suppress serializable warnings because although Exception implements Serializable, GlideException
+// is never serialized across processes or networks, making serialization checks irrelevant.
+@SuppressWarnings({"WeakerAccess", "serial"})
 public final class GlideException extends Exception {
   private static final long serialVersionUID = 1L;
 
@@ -126,7 +128,7 @@ public final class GlideException extends Exception {
       for (Throwable t : glideException.getCauses()) {
         addRootCauses(t, rootCauses);
       }
-    } else {
+    } else if (throwable != null) {
       rootCauses.add(throwable);
     }
   }
@@ -185,7 +187,7 @@ public final class GlideException extends Exception {
   // Appendable throws, PrintWriter, PrintStream, and IndentedAppendable do not, so this should
   // never happen.
   @SuppressWarnings("PMD.PreserveStackTrace")
-  private static void appendExceptionMessage(Throwable t, Appendable appendable) {
+  private static void appendExceptionMessage(@NonNull Throwable t, Appendable appendable) {
     try {
       appendable.append(t.getClass().toString()).append(": ").append(t.getMessage()).append('\n');
     } catch (IOException e1) {
@@ -220,6 +222,8 @@ public final class GlideException extends Exception {
       if (cause instanceof GlideException) {
         GlideException glideCause = (GlideException) cause;
         glideCause.printStackTrace(appendable);
+      } else if (cause == null) {
+        appendable.append("null\n");
       } else {
         appendExceptionMessage(cause, appendable);
       }

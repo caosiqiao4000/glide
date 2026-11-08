@@ -10,6 +10,7 @@ import androidx.annotation.VisibleForTesting;
 import com.bumptech.glide.util.Synthetic;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -21,6 +22,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 /** A prioritized {@link ThreadPoolExecutor} for running jobs in Glide. */
 public final class GlideExecutor implements ExecutorService {
@@ -63,6 +65,11 @@ public final class GlideExecutor implements ExecutorService {
   private static volatile int bestThreadCount;
 
   private final ExecutorService delegate;
+
+  /** The default priority for threads created by Glide. */
+  public static final int DEFAULT_PRIORITY =
+      android.os.Process.THREAD_PRIORITY_BACKGROUND
+          + android.os.Process.THREAD_PRIORITY_MORE_FAVORABLE;
 
   /**
    * Returns a new {@link Builder} with the {@link #DEFAULT_DISK_CACHE_EXECUTOR_THREADS} threads,
@@ -168,19 +175,15 @@ public final class GlideExecutor implements ExecutorService {
    *
    * <p>Source executors allow network operations on their threads.
    */
+  public static GlideExecutor.Builder newUnlimitedSourceBuilder() {
+    return new GlideExecutor.Builder(/* preventNetworkOperations= */ false, /* isUnlimited= */ true)
+        .setThreadTimeoutMillis(KEEP_ALIVE_TIME_MS)
+        .setName(DEFAULT_SOURCE_UNLIMITED_EXECUTOR_NAME);
+  }
+
+  /** Shortcut for calling {@link Builder#build()} on {@link #newUnlimitedSourceBuilder()}. */
   public static GlideExecutor newUnlimitedSourceExecutor() {
-    return new GlideExecutor(
-        new ThreadPoolExecutor(
-            0,
-            Integer.MAX_VALUE,
-            KEEP_ALIVE_TIME_MS,
-            TimeUnit.MILLISECONDS,
-            new SynchronousQueue<Runnable>(),
-            new DefaultThreadFactory(
-                new DefaultPriorityThreadFactory(),
-                DEFAULT_SOURCE_UNLIMITED_EXECUTOR_NAME,
-                UncaughtThrowableStrategy.DEFAULT,
-                false)));
+    return newUnlimitedSourceBuilder().build();
   }
 
   /**
@@ -339,6 +342,7 @@ public final class GlideExecutor implements ExecutorService {
             // ignore
           }
         };
+
     /** Logs the uncaught {@link Throwable}s using {@link #TAG} and {@link Log}. */
     UncaughtThrowableStrategy LOG =
         new UncaughtThrowableStrategy() {
@@ -349,6 +353,7 @@ public final class GlideExecutor implements ExecutorService {
             }
           }
         };
+
     /** Rethrows the uncaught {@link Throwable}s to crash the app. */
     // Public API.
     @SuppressWarnings("unused")
@@ -369,9 +374,6 @@ public final class GlideExecutor implements ExecutorService {
   }
 
   private static final class DefaultPriorityThreadFactory implements ThreadFactory {
-    private static final int DEFAULT_PRIORITY =
-        android.os.Process.THREAD_PRIORITY_BACKGROUND
-            + android.os.Process.THREAD_PRIORITY_MORE_FAVORABLE;
 
     @Override
     public Thread newThread(@NonNull Runnable runnable) {
@@ -441,6 +443,7 @@ public final class GlideExecutor implements ExecutorService {
     public static final long NO_THREAD_TIMEOUT = 0L;
 
     private final boolean preventNetworkOperations;
+    private final boolean isUnlimited;
 
     private int corePoolSize;
     private int maximumPoolSize;
@@ -452,10 +455,21 @@ public final class GlideExecutor implements ExecutorService {
 
     private String name;
     private long threadTimeoutMillis;
+    @Synthetic Function<? super Runnable, ? extends Runnable> onExecuteDecorator;
 
     @Synthetic
     Builder(boolean preventNetworkOperations) {
+      this(preventNetworkOperations, /* isUnlimited= */ false);
+    }
+
+    @Synthetic
+    Builder(boolean preventNetworkOperations, boolean isUnlimited) {
       this.preventNetworkOperations = preventNetworkOperations;
+      this.isUnlimited = isUnlimited;
+      if (isUnlimited) {
+        corePoolSize = 0;
+        maximumPoolSize = Integer.MAX_VALUE;
+      }
     }
 
     /**
@@ -471,6 +485,10 @@ public final class GlideExecutor implements ExecutorService {
 
     /** Sets the maximum number of threads to use. */
     public Builder setThreadCount(@IntRange(from = 1) int threadCount) {
+      if (isUnlimited) {
+        throw new UnsupportedOperationException(
+            "Thread count cannot be configured on an unlimited source executor");
+      }
       corePoolSize = threadCount;
       maximumPoolSize = threadCount;
       return this;
@@ -510,21 +528,53 @@ public final class GlideExecutor implements ExecutorService {
       return this;
     }
 
+    /**
+     * Sets the decorator to be applied to each runnable executed by the executor.
+     *
+     * <p>This is an experimental method that may be removed without warning in a future version.
+     */
+    public Builder experimentalSetOnExecuteDecorator(
+        Function<? super Runnable, ? extends Runnable> onExecuteDecorator) {
+      this.onExecuteDecorator = onExecuteDecorator;
+      return this;
+    }
+
     /** Builds a new {@link GlideExecutor} with any previously specified options. */
     public GlideExecutor build() {
       if (TextUtils.isEmpty(name)) {
         throw new IllegalArgumentException(
             "Name must be non-null and non-empty, but given: " + name);
       }
-      ThreadPoolExecutor executor =
-          new ThreadPoolExecutor(
-              corePoolSize,
-              maximumPoolSize,
-              /* keepAliveTime= */ threadTimeoutMillis,
-              TimeUnit.MILLISECONDS,
-              new PriorityBlockingQueue<Runnable>(),
-              new DefaultThreadFactory(
-                  threadFactory, name, uncaughtThrowableStrategy, preventNetworkOperations));
+      ThreadFactory factory =
+          new DefaultThreadFactory(
+              threadFactory, name, uncaughtThrowableStrategy, preventNetworkOperations);
+      BlockingQueue<Runnable> queue =
+          isUnlimited ? new SynchronousQueue<>() : new PriorityBlockingQueue<>();
+      ThreadPoolExecutor executor;
+      if (onExecuteDecorator != null) {
+        executor =
+            new ThreadPoolExecutor(
+                corePoolSize,
+                maximumPoolSize,
+                /* keepAliveTime= */ threadTimeoutMillis,
+                TimeUnit.MILLISECONDS,
+                queue,
+                factory) {
+              @Override
+              public void execute(@NonNull Runnable command) {
+                super.execute(onExecuteDecorator.apply(command));
+              }
+            };
+      } else {
+        executor =
+            new ThreadPoolExecutor(
+                corePoolSize,
+                maximumPoolSize,
+                /* keepAliveTime= */ threadTimeoutMillis,
+                TimeUnit.MILLISECONDS,
+                queue,
+                factory);
+      }
 
       if (threadTimeoutMillis != NO_THREAD_TIMEOUT) {
         executor.allowCoreThreadTimeOut(true);

@@ -27,7 +27,7 @@ import java.lang.annotation.Target;
  * be avoided. The preferred style looks like:
  *
  * <pre>{@code
- * {@link @}GlideExtension
+ * {@literal @}GlideExtension
  * public class MyExtension {
  *   private MyExtension() {}
  *
@@ -68,8 +68,10 @@ import java.lang.annotation.Target;
 public @interface GlideOption {
   /** Does not intend to override a method in a super class. */
   int OVERRIDE_NONE = 0;
+
   /** Expects to call super and then add additional functionality to an overridden method. */
   int OVERRIDE_EXTEND = 1;
+
   /** Expects to not call super and replace an overridden method. */
   int OVERRIDE_REPLACE = 2;
 

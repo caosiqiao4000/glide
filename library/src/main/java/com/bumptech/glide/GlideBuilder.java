@@ -44,15 +44,16 @@ import java.util.Map;
 public final class GlideBuilder {
   private final Map<Class<?>, TransitionOptions<?, ?>> defaultTransitionOptions = new ArrayMap<>();
   private final GlideExperiments.Builder glideExperimentsBuilder = new GlideExperiments.Builder();
-  private Engine engine;
-  private BitmapPool bitmapPool;
-  private ArrayPool arrayPool;
-  private MemoryCache memoryCache;
-  private GlideExecutor sourceExecutor;
-  private GlideExecutor diskCacheExecutor;
-  private DiskCache.Factory diskCacheFactory;
-  private MemorySizeCalculator memorySizeCalculator;
-  private ConnectivityMonitorFactory connectivityMonitorFactory;
+  @Nullable private Engine engine;
+  @Nullable private BitmapPool bitmapPool;
+  @Nullable private ArrayPool arrayPool;
+  @Nullable private MemoryCache memoryCache;
+  @Nullable private GlideExecutor sourceExecutor;
+  @Nullable private GlideExecutor diskCacheExecutor;
+  @Nullable private GlideExecutor sourceUnlimitedExecutor;
+  @Nullable private DiskCache.Factory diskCacheFactory;
+  @Nullable private MemorySizeCalculator memorySizeCalculator;
+  @Nullable private ConnectivityMonitorFactory connectivityMonitorFactory;
   private int logLevel = Log.INFO;
   private RequestOptionsFactory defaultRequestOptionsFactory =
       new RequestOptionsFactory() {
@@ -63,7 +64,7 @@ public final class GlideBuilder {
         }
       };
   @Nullable private RequestManagerFactory requestManagerFactory;
-  private GlideExecutor animationExecutor;
+  @Nullable private GlideExecutor animationExecutor;
   private boolean isActiveResourceRetentionAllowed;
   @Nullable private List<RequestListener<Object>> defaultRequestListeners;
 
@@ -208,6 +209,24 @@ public final class GlideBuilder {
   @NonNull
   public GlideBuilder setAnimationExecutor(@Nullable GlideExecutor service) {
     this.animationExecutor = service;
+    return this;
+  }
+
+  /**
+   * Sets the {@link GlideExecutor} to use when retrieving {@link
+   * com.bumptech.glide.load.engine.Resource}s that are not already in the cache using the unlimited
+   * source generators pool.
+   *
+   * @param service The ExecutorService to use.
+   * @return This builder.
+   * @see #setSourceExecutor(GlideExecutor)
+   * @see GlideExecutor#newUnlimitedSourceExecutor()
+   */
+  // Public API.
+  @SuppressWarnings("WeakerAccess")
+  @NonNull
+  public GlideBuilder setSourceUnlimitedExecutor(@Nullable GlideExecutor service) {
+    this.sourceUnlimitedExecutor = service;
     return this;
   }
 
@@ -377,7 +396,7 @@ public final class GlideBuilder {
    * com.bumptech.glide.request.target.Target}s that haven't yet been cleared. Setting this method
    * to {@code true} allows Glide to also maintain a hard reference to the underlying resource so
    * that if the {@link com.bumptech.glide.request.target.Target} is garbage collected, Glide can
-   * return the underlying resource to it's memory cache so that subsequent requests will not
+   * return the underlying resource to its memory cache so that subsequent requests will not
    * unexpectedly re-load the resource from disk or source. As a side affect, it will take the
    * system slightly longer to garbage collect the underlying resource because the weak reference
    * has to be cleared and processed before the hard reference is removed. As a result, setting this
@@ -488,6 +507,220 @@ public final class GlideBuilder {
   }
 
   /**
+   * Set to {@code true} to make Glide use {@link android.graphics.ImageDecoder} when decoding
+   * {@link Bitmap}s from local {@link android.net.Uri}s on Android Q and higher.
+   *
+   * <p>This functionality is also guarded by {@link #setImageDecoderEnabledForBitmaps(boolean)} and
+   * will only be active if that flag is also enabled.
+   *
+   * <p>Calls to this method on versions of Android less than Q are ignored.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setUriImageDecoderEnabled(boolean isEnabled) {
+    glideExperimentsBuilder.update(
+        new EnableUriImageDecoder(),
+        /* isEnabled= */ isEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to make Glide use a heap buffer instead of a direct buffer when decoding
+   * {@link Bitmap}s from an {@link java.io.InputStream} using {@link
+   * android.graphics.ImageDecoder}.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setUseHeapBufferForImageDecoderWithInputStream(boolean isEnabled) {
+    glideExperimentsBuilder.update(new UseHeapBufferForImageDecoderWithInputStream(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to make Glide pool intermediate reading buffers and allocate precisely one
+   * tailored {@link java.nio.ByteBuffer} using {@link ArrayPool} when decoding from an {@link
+   * java.io.InputStream} via {@link android.graphics.ImageDecoder}.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setUseArrayPoolForImageDecoderByteBufferAllocation(boolean isEnabled) {
+    glideExperimentsBuilder.update(
+        new UseArrayPoolForImageDecoderByteBufferAllocation(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to enable direct {@link java.nio.ByteBuffer} decoding instead of wrapping
+   * buffers in an {@link java.io.InputStream}. Disabled by default.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setEnableDirectByteBufferDecoding(boolean isEnabled) {
+    glideExperimentsBuilder.update(new EnableDirectByteBufferDecoding(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to fix allocating twice as much space as necessary for RGB_565 images.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder experimentalSetEnableRgb565DownsamplerFix(boolean isEnabled) {
+    glideExperimentsBuilder.update(new EnableRgb565DownsamplerFix(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to skip writing resources backed by {@link
+   * android.graphics.Bitmap.Config#HARDWARE} bitmaps to the resource disk cache.
+   *
+   * <p>Compressing a hardware bitmap requires the framework to copy its pixels from graphics memory
+   * back into a software bitmap first. That copy occupies the Glide worker thread and the
+   * RenderThread for the duration, and transiently allocates a second, full-size copy of the image
+   * in native memory. Skipping the write avoids all of that while leaving the hardware bitmap in
+   * place for display.
+   *
+   * <p>This applies to any {@link com.bumptech.glide.load.engine.DiskCacheStrategy} that would
+   * otherwise permit the resource to be cached, including {@link
+   * com.bumptech.glide.load.engine.DiskCacheStrategy#AUTOMATIC}. The trade-off is that a later
+   * request for the same transformed hardware bitmap that misses the memory cache is decoded again
+   * from the data cache or the source rather than read from the resource cache.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setBypassResourceDiskCacheForHardwareBitmaps(boolean isEnabled) {
+    glideExperimentsBuilder.update(new BypassResourceDiskCacheForHardwareBitmaps(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to inspect EXIF orientation in {@link ImageDecoder} and decode rotated
+   * images in software to avoid GPU readbacks and decode overhead.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setRespectExifOrientationInImageDecoder(boolean isEnabled) {
+    glideExperimentsBuilder.update(new RespectExifOrientationInImageDecoder(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to decode {@link InputStream} sources with {@link
+   * android.graphics.BitmapFactory} even when {@link ImageDecoder} is enabled for bitmaps.
+   *
+   * <p>{@link ImageDecoder} cannot read from a stream, so decoding an {@link InputStream} with it
+   * requires copying the entire encoded image into a contiguous {@link java.nio.ByteBuffer} first,
+   * which can exhaust the Java heap on large images. With this flag enabled {@link ImageDecoder} is
+   * used only for sources it can read in place ({@link java.io.File}, {@link
+   * android.os.ParcelFileDescriptor}, {@link android.net.Uri} and {@link java.nio.ByteBuffer}) and
+   * streams fall back to {@link android.graphics.BitmapFactory}, which reads incrementally in
+   * native code.
+   *
+   * <p>This flag is experimental and may be removed without deprecation in a future version.
+   */
+  public GlideBuilder setUseBitmapFactoryForInputStreamsWithImageDecoder(boolean isEnabled) {
+    glideExperimentsBuilder.update(
+        new UseBitmapFactoryForInputStreamsWithImageDecoder(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Override the OS thread priority of threads created in {@code
+   * com.bumptech.glide.load.engine.executor.GlideExecutor.DefaultThreadFactory} with {@link
+   * com.bumptech.glide.load.engine.DecodeJob#GLIDE_THREAD_PRIORITY_OVERRIDE} Glide Option.
+   *
+   * <p>This is an experimental API that may be removed in the future.
+   */
+  public GlideBuilder setOverrideGlideThreadPriority(boolean isEnabled) {
+    glideExperimentsBuilder.update(new OverrideGlideThreadPriority(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to make Glide use {@code
+   * android.provider.MediaStore#openAssetFileDescriptor(ContentResolver, Uri, String,
+   * CancellationSignal)} when opening {@link android.provider.MediaStore#AUTHORITY} content URIs
+   * when it is available.
+   *
+   * <p>This is an experimental API that may be removed in the future.
+   */
+  public GlideBuilder setUseMediaStoreOpenFileApisIfPossible(boolean isEnabled) {
+    glideExperimentsBuilder.update(new UseMediaStoreOpenFileApisIfPossible(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to make Glide use {@link MemoryCategory} to set the memory category when
+   * the app is in the background.
+   *
+   * <p>This is an experimental API that may be removed in the future.
+   */
+  public GlideBuilder setMemoryCategoryInBackground(MemoryCategory memoryCategory) {
+    glideExperimentsBuilder.add(new MemoryCategoryInBackground(memoryCategory));
+    return this;
+  }
+
+  /**
+   * Sets whether Glide triggers {@link #setMemoryCategoryInBackground(MemoryCategory)} on {@link
+   * android.content.ComponentCallbacks2#TRIM_MEMORY_UI_HIDDEN} (level 20) in addition to higher
+   * levels.
+   *
+   * <p>This experimental change ensures that applications configured with {@link
+   * #setMemoryCategoryInBackground(MemoryCategory)} properly reduce memory usage as soon as the app
+   * moves to the background.
+   *
+   * <p>This is an experimental API that may be removed in the future.
+   */
+  public GlideBuilder experimentalSetEnableTrimMemoryOnUiHidden(boolean isEnabled) {
+    glideExperimentsBuilder.update(new EnableTrimMemoryOnUiHidden(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Set to {@code true} to make loads skip an active resource that no request holds anymore,
+   * instead of acquiring it again. The load then falls through to the memory cache.
+   *
+   * <p>This avoids "Cannot recycle a resource while it is still acquired" crashes. See
+   * https://github.com/bumptech/glide/issues/5782.
+   *
+   * <p>This is an experimental API that may be removed in the future.
+   */
+  public GlideBuilder experimentalSetEnableActiveResourceReleaseRaceFix(boolean isEnabled) {
+    glideExperimentsBuilder.update(new EnableActiveResourceReleaseRaceFix(), isEnabled);
+    return this;
+  }
+
+  /**
+   * Enables clearing active requests and releasing Bitmaps in Compose {@code GlidePainter} when the
+   * host {@code LifecycleOwner} transitions below {@code Lifecycle.State.STARTED} (i.e. {@code
+   * ON_STOP}).
+   *
+   * <p>This is an experimental API that may be removed in the future.
+   */
+  public GlideBuilder experimentalSetClearGlidePainterOnStop(boolean isEnabled) {
+    glideExperimentsBuilder.update(new ClearGlidePainterOnStop(), isEnabled);
+    return this;
+  }
+
+  /**
+   * @deprecated This method does nothing. It will be hard coded and removed in a future release
+   *     without further warning.
+   */
+  @Deprecated
+  public GlideBuilder setPreserveGainmapAndColorSpaceForTransformations(boolean isEnabled) {
+    return this;
+  }
+
+  /**
+   * @deprecated This method does nothing. It will be hard coded and removed in a future release
+   *     without further warning.
+   */
+  @Deprecated
+  public GlideBuilder setEnableHardwareGainmapFixOnU(boolean isEnabled) {
+    return this;
+  }
+
+  /**
    * @deprecated This method does nothing. It will be hard coded and removed in a future release
    *     without further warning.
    */
@@ -521,6 +754,10 @@ public final class GlideBuilder {
 
     if (animationExecutor == null) {
       animationExecutor = GlideExecutor.newAnimationExecutor();
+    }
+
+    if (sourceUnlimitedExecutor == null) {
+      sourceUnlimitedExecutor = GlideExecutor.newUnlimitedSourceExecutor();
     }
 
     if (memorySizeCalculator == null) {
@@ -559,7 +796,7 @@ public final class GlideBuilder {
               diskCacheFactory,
               diskCacheExecutor,
               sourceExecutor,
-              GlideExecutor.newUnlimitedSourceExecutor(),
+              sourceUnlimitedExecutor,
               animationExecutor,
               isActiveResourceRetentionAllowed);
     }
@@ -602,6 +839,57 @@ public final class GlideBuilder {
 
   static final class EnableImageDecoderForBitmaps implements Experiment {}
 
+  static final class EnableUriImageDecoder implements Experiment {}
+
+  /** See {@link #setUseHeapBufferForImageDecoderWithInputStream(boolean)}. */
+  public static final class UseHeapBufferForImageDecoderWithInputStream implements Experiment {}
+
+  /** See {@link #setUseArrayPoolForImageDecoderByteBufferAllocation(boolean)}. */
+  public static final class UseArrayPoolForImageDecoderByteBufferAllocation implements Experiment {}
+
+  /** See {@link #setEnableDirectByteBufferDecoding(boolean)}. */
+  public static final class EnableDirectByteBufferDecoding implements Experiment {}
+
+  /** See {@link #experimentalSetEnableRgb565DownsamplerFix(boolean)}. */
+  public static final class EnableRgb565DownsamplerFix implements Experiment {}
+
+  /** See {@link #setBypassResourceDiskCacheForHardwareBitmaps(boolean)}. */
+  public static final class BypassResourceDiskCacheForHardwareBitmaps implements Experiment {}
+
+  /** See {@link #setRespectExifOrientationInImageDecoder(boolean)}. */
+  public static final class RespectExifOrientationInImageDecoder implements Experiment {}
+
+  /** See {@link #setUseBitmapFactoryForInputStreamsWithImageDecoder(boolean)}. */
+  public static final class UseBitmapFactoryForInputStreamsWithImageDecoder implements Experiment {}
+
+  /** See {@link #experimentalSetEnableTrimMemoryOnUiHidden(boolean)}. */
+  public static final class EnableTrimMemoryOnUiHidden implements Experiment {}
+
+  /** See {@link #experimentalSetEnableActiveResourceReleaseRaceFix(boolean)}. */
+  public static final class EnableActiveResourceReleaseRaceFix implements Experiment {}
+
+  /** See {@link #experimentalSetClearGlidePainterOnStop(boolean)}. */
+  public static final class ClearGlidePainterOnStop implements Experiment {}
+
   /** See {@link #setLogRequestOrigins(boolean)}. */
   public static final class LogRequestOrigins implements Experiment {}
+
+  /** See {@link #setOverrideGlideThreadPriority(boolean)}. */
+  public static final class OverrideGlideThreadPriority implements Experiment {}
+
+  /** See {@link #setUseMediaStoreOpenFileApisIfPossible(boolean)}. */
+  public static final class UseMediaStoreOpenFileApisIfPossible implements Experiment {}
+
+  /** See {@link #setMemoryCategoryInBackground(MemoryCategory)}. */
+  public static final class MemoryCategoryInBackground implements Experiment {
+    private final MemoryCategory memoryCategory;
+
+    MemoryCategoryInBackground(MemoryCategory memoryCategory) {
+      this.memoryCategory = memoryCategory;
+    }
+
+    public MemoryCategory value() {
+      return memoryCategory;
+    }
+  }
 }

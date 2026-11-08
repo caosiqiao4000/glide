@@ -1,21 +1,30 @@
 package com.bumptech.glide.load.engine;
 
+import android.graphics.Bitmap;
+import android.graphics.drawable.BitmapDrawable;
 import android.os.Build;
+import android.os.Process;
 import android.util.Log;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 import androidx.core.util.Pools;
+import com.bumptech.glide.GlideBuilder;
+import com.bumptech.glide.GlideBuilder.OverrideGlideThreadPriority;
 import com.bumptech.glide.GlideContext;
+import com.bumptech.glide.GlideExperiments;
 import com.bumptech.glide.Priority;
 import com.bumptech.glide.Registry;
 import com.bumptech.glide.load.DataSource;
 import com.bumptech.glide.load.EncodeStrategy;
 import com.bumptech.glide.load.Key;
+import com.bumptech.glide.load.Option;
 import com.bumptech.glide.load.Options;
 import com.bumptech.glide.load.ResourceEncoder;
 import com.bumptech.glide.load.Transformation;
 import com.bumptech.glide.load.data.DataFetcher;
 import com.bumptech.glide.load.data.DataRewinder;
 import com.bumptech.glide.load.engine.cache.DiskCache;
+import com.bumptech.glide.load.engine.executor.GlideExecutor;
 import com.bumptech.glide.load.resource.bitmap.Downsampler;
 import com.bumptech.glide.util.LogTime;
 import com.bumptech.glide.util.Synthetic;
@@ -25,6 +34,7 @@ import com.bumptech.glide.util.pool.StateVerifier;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * A class responsible for decoding resources either from cached data or from the original source
@@ -41,6 +51,23 @@ class DecodeJob<R>
         Comparable<DecodeJob<?>>,
         Poolable {
   private static final String TAG = "DecodeJob";
+
+  /**
+   * {@link com.bumptech.glide.load.Option} to override the OS thread priority of the thread
+   * handling the decode job.
+   *
+   * <p>Acceptable values are integer constants defined in {@link android.os.Process}, ranging from
+   * {@link android.os.Process#THREAD_PRIORITY_LOWEST} to (-20). Any exceptions thrown will cause
+   * the override to fail silently and disable overrides on any subsequent jobs.
+   *
+   * <p>Must have {@link com.bumptech.glide.GlideBuilder#setOverrideGlideThreadPriority(boolean)}
+   * experiment enabled to be used.
+   *
+   * <p>This is used for a highly experimental API that may be removed in the future. Please use at
+   * your own risk.
+   */
+  public static final Option<Supplier<Integer>> GLIDE_THREAD_PRIORITY_OVERRIDE =
+      Option.memory("glide_thread_priority_override");
 
   private final DecodeHelper<R> decodeHelper = new DecodeHelper<>();
   private final List<Throwable> throwables = new ArrayList<>();
@@ -65,6 +92,8 @@ class DecodeJob<R>
   private long startFetchTime;
   private boolean onlyRetrieveFromCache;
   private Object model;
+  private GlideExperiments experiments;
+  @Nullable private Supplier<Integer> glideThreadPriorityOverride;
 
   private Thread currentThread;
   private Key currentSourceKey;
@@ -129,6 +158,8 @@ class DecodeJob<R>
     this.order = order;
     this.runReason = RunReason.INITIALIZE;
     this.model = model;
+    this.experiments = glideContext.getExperiments();
+    this.glideThreadPriorityOverride = options.get(GLIDE_THREAD_PRIORITY_OVERRIDE);
     return this;
   }
 
@@ -197,15 +228,11 @@ class DecodeJob<R>
 
   @Override
   public int compareTo(@NonNull DecodeJob<?> other) {
-    int result = getPriority() - other.getPriority();
+    int result = priority.compareTo(other.priority);
     if (result == 0) {
       result = order - other.order;
     }
     return result;
-  }
-
-  private int getPriority() {
-    return priority.ordinal();
   }
 
   public void cancel() {
@@ -326,7 +353,33 @@ class DecodeJob<R>
     // onDataFetcherReady.
   }
 
+  /**
+   * Restores the OS priority of the Glide thread to the default thread priority of {@link
+   * com.bumptech.glide.load.engine.executor.GlideExecutor}.
+   */
+  private void restoreThreadPriority() {
+    if (!experiments.isEnabled(OverrideGlideThreadPriority.class)) {
+      throw new IllegalStateException("OverrideGlideThreadPriority experiment is not enabled.");
+    }
+    if (glideThreadPriorityOverride != null && glideThreadPriorityOverride.get() != null) {
+      try {
+        Process.setThreadPriority(Process.myTid(), GlideExecutor.DEFAULT_PRIORITY);
+      } catch (IllegalArgumentException | SecurityException e) {
+        glideThreadPriorityOverride = null;
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+          Log.v(
+              TAG,
+              "Failed to set thread priority; using default priority for any subsequent jobs.",
+              e);
+        }
+      }
+    }
+  }
+
   private void notifyFailed() {
+    if (experiments.isEnabled(OverrideGlideThreadPriority.class)) {
+      restoreThreadPriority();
+    }
     setNotifiedOrThrow();
     GlideException e = new GlideException("Failed to load resource", new ArrayList<>(throwables));
     callback.onLoadFailed(e);
@@ -335,6 +388,9 @@ class DecodeJob<R>
 
   private void notifyComplete(
       Resource<R> resource, DataSource dataSource, boolean isLoadedFromAlternateCacheKey) {
+    if (experiments.isEnabled(OverrideGlideThreadPriority.class)) {
+      restoreThreadPriority();
+    }
     setNotifiedOrThrow();
     callback.onResourceReady(resource, dataSource, isLoadedFromAlternateCacheKey);
   }
@@ -428,6 +484,21 @@ class DecodeJob<R>
               + currentSourceKey
               + ", fetcher: "
               + currentFetcher);
+    }
+    if (experiments.isEnabled(OverrideGlideThreadPriority.class)
+        && glideThreadPriorityOverride != null
+        && glideThreadPriorityOverride.get() != null) {
+      try {
+        Process.setThreadPriority(Process.myTid(), glideThreadPriorityOverride.get().intValue());
+      } catch (IllegalArgumentException | SecurityException e) {
+        glideThreadPriorityOverride = null;
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+          Log.v(
+              TAG,
+              "Failed to set thread priority; using default priority for any subsequent jobs.",
+              e);
+        }
+      }
     }
     Resource<R> resource = null;
     try {
@@ -575,7 +646,18 @@ class DecodeJob<R>
     Resource<Z> transformed = decoded;
     if (dataSource != DataSource.RESOURCE_DISK_CACHE) {
       appliedTransformation = decodeHelper.getTransformation(resourceSubClass);
-      transformed = appliedTransformation.transform(glideContext, decoded, width, height);
+      if (shouldBypassSoftwareTransformation(decoded, appliedTransformation)) {
+        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+          Log.v(
+              TAG,
+              "Bypassing software transformations for resource: "
+                  + decoded.get()
+                  + " with transformation: "
+                  + appliedTransformation);
+        }
+      } else {
+        transformed = appliedTransformation.transform(glideContext, decoded, width, height);
+      }
     }
     // TODO: Make this the responsibility of the Transformation.
     if (!decoded.equals(transformed)) {
@@ -594,8 +676,9 @@ class DecodeJob<R>
 
     Resource<Z> result = transformed;
     boolean isFromAlternateCacheKey = !decodeHelper.isSourceKey(currentSourceKey);
-    if (diskCacheStrategy.isResourceCacheable(
-        isFromAlternateCacheKey, dataSource, encodeStrategy)) {
+    boolean isResourceCacheable =
+        isResourceCacheable(isFromAlternateCacheKey, dataSource, encodeStrategy, transformed);
+    if (isResourceCacheable) {
       if (encoder == null) {
         throw new Registry.NoResultEncoderAvailableException(transformed.get().getClass());
       }
@@ -625,6 +708,70 @@ class DecodeJob<R>
       result = lockedResult;
     }
     return result;
+  }
+
+  /**
+   * Returns {@code true} if the decoded and transformed resource is eligible to be written to the
+   * resource disk cache.
+   *
+   * <p>When {@link GlideBuilder.BypassResourceDiskCacheForHardwareBitmaps} is enabled, resources
+   * backed by {@link Bitmap.Config#HARDWARE} bitmaps are never written. Compressing a hardware
+   * bitmap requires the framework to copy its pixels out of graphics memory into a software bitmap
+   * ({@code RenderProxy#copyHWBitmapInto}). That copy runs on this job's thread after the resource
+   * has been delivered, round-trips through the RenderThread (contending with frame rendering),
+   * holds the {@link LockedResource} until it finishes, and transiently allocates a second,
+   * full-size copy of the image in native memory.
+   */
+  private <Z> boolean isResourceCacheable(
+      boolean isFromAlternateCacheKey,
+      DataSource dataSource,
+      EncodeStrategy encodeStrategy,
+      Resource<Z> transformed) {
+    if (!diskCacheStrategy.isResourceCacheable(
+        isFromAlternateCacheKey, dataSource, encodeStrategy)) {
+      return false;
+    }
+    if (experiments.isEnabled(GlideBuilder.BypassResourceDiskCacheForHardwareBitmaps.class)
+        && isHardwareBitmap(transformed)) {
+      return false;
+    }
+    return true;
+  }
+
+  private static boolean isHardwareBitmap(Resource<?> resource) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+      return false;
+    }
+    Object content = resource.get();
+    Bitmap bitmap = null;
+    if (content instanceof Bitmap) {
+      bitmap = (Bitmap) content;
+    } else if (content instanceof BitmapDrawable) {
+      bitmap = ((BitmapDrawable) content).getBitmap();
+    }
+    return bitmap != null && bitmap.getConfig() == Bitmap.Config.HARDWARE;
+  }
+
+  /**
+   * Returns {@code true} if we should bypass applying software transformations to the decoded
+   * resource.
+   *
+   * <p>This is only true if the resource is a hardware bitmap, and both ALLOW_HARDWARE_CONFIG and
+   * BYPASS_TRANSFORMATIONS_FOR_HARDWARE_BITMAPS options are enabled.
+   */
+  private <Z> boolean shouldBypassSoftwareTransformation(
+      Resource<Z> decoded, Transformation<Z> transformation) {
+    Boolean bypassOption = options.get(Downsampler.BYPASS_TRANSFORMATIONS_FOR_HARDWARE_BITMAPS);
+    if (bypassOption == null || !bypassOption) {
+      return false;
+    }
+
+    Boolean allowHardware = options.get(Downsampler.ALLOW_HARDWARE_CONFIG);
+    if (allowHardware == null || !allowHardware) {
+      return false;
+    }
+
+    return isHardwareBitmap(decoded);
   }
 
   private final class DecodeCallback<Z> implements DecodePath.DecodeCallback<Z> {

@@ -5,11 +5,13 @@ import com.bumptech.glide.annotation.ksp.GlideSymbolProcessorConstants
 import com.google.common.truth.Truth.assertThat
 import com.tschuchort.compiletesting.KotlinCompilation
 import org.intellij.lang.annotations.Language
+import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.Parameterized
 
 @RunWith(Parameterized::class)
+@OptIn(ExperimentalCompilerApi::class)
 class OnlyAppGlideModuleTests(override val sourceType: SourceType) : PerSourceTypeTest {
 
   companion object {
@@ -75,6 +77,46 @@ class OnlyAppGlideModuleTests(override val sourceType: SourceType) : PerSourceTy
     compileCurrentSourceType(kotlinModule, javaModule) {
       assertThat(it.generatedAppGlideModuleContents())
         .hasSourceEqualTo(CommonSources.simpleAppGlideModule)
+      assertThat(it.exitCode).isEqualTo(KotlinCompilation.ExitCode.OK)
+    }
+  }
+
+  @Test
+  fun compile_withGlideModuleOnValidAppGlideModuleThroughBaseClass_generatedGeneratedAppGlideModule() {
+    val kotlinModule =
+      KotlinSourceFile(
+        "AppModule.kt",
+        """
+      import com.bumptech.glide.annotation.GlideModule
+      import com.bumptech.glide.module.AppGlideModule
+      class BaseAppModule : AppGlideModule()
+        @GlideModule class AppModule : BaseAppModule()
+        """
+      )
+    val javaBaseAppModule =
+      JavaSourceFile(
+        "BaseAppModule.java",
+        """
+          import com.bumptech.glide.module.AppGlideModule;
+
+          public class BaseAppModule extends AppGlideModule {}
+        """
+                .trimIndent()
+      )
+    val javaModule =
+      JavaSourceFile(
+        "AppModule.java",
+        """
+          import com.bumptech.glide.annotation.GlideModule;
+
+          @GlideModule public class AppModule extends BaseAppModule {}
+        """
+                .trimIndent()
+      )
+
+    compileCurrentSourceType(kotlinModule, javaBaseAppModule, javaModule) {
+      assertThat(it.generatedAppGlideModuleContents())
+          .hasSourceEqualTo(CommonSources.simpleAppGlideModule)
       assertThat(it.exitCode).isEqualTo(KotlinCompilation.ExitCode.OK)
     }
   }
@@ -179,7 +221,7 @@ class OnlyAppGlideModuleTests(override val sourceType: SourceType) : PerSourceTy
 
   // This is quite weird, we could probably pretty reasonably just assert that this doesn't happen.
   @Test
-  fun compile_withAppGlideModuleWithOneEmptyrConstructor_andOneContextOnlyConstructor_usesTheContextOnlyConstructor() {
+  fun compile_withAppGlideModuleWithOneEmptyConstructor_andOneContextOnlyConstructor_usesTheContextOnlyConstructor() {
     val kotlinModule =
       KotlinSourceFile(
         "AppModule.kt",
@@ -217,7 +259,7 @@ class OnlyAppGlideModuleTests(override val sourceType: SourceType) : PerSourceTy
   }
 
   @Test
-  fun copmile_withMultipleAppGlideModules_failes() {
+  fun compile_withMultipleAppGlideModules_fails() {
     val firstKtModule =
       KotlinSourceFile(
         "Module1.kt",

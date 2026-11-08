@@ -9,11 +9,13 @@ import com.bumptech.glide.annotation.ksp.test.hasSourceEqualTo
 import com.google.common.truth.Truth.assertThat
 import com.tschuchort.compiletesting.KotlinCompilation.ExitCode
 import org.intellij.lang.annotations.Language
+import org.jetbrains.kotlin.compiler.plugin.ExperimentalCompilerApi
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.Parameterized
 import org.junit.runners.Parameterized.Parameters
 
+@OptIn(ExperimentalCompilerApi::class)
 @RunWith(Parameterized::class)
 class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : PerSourceTypeTest {
 
@@ -31,7 +33,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         import com.bumptech.glide.module.AppGlideModule
 
         @GlideModule class AppModule : AppGlideModule()
-        """
+        """,
       )
     val javaAppModule =
       JavaSourceFile(
@@ -43,13 +45,53 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
           @GlideModule public class AppModule extends AppGlideModule {
             public AppModule() {}
           }
-        """
+        """,
       )
 
-    compileCurrentSourceType(
-      kotlinAppModule,
-      javaAppModule,
-    ) {
+    compileCurrentSourceType(kotlinAppModule, javaAppModule) {
+      assertThat(it.exitCode).isEqualTo(ExitCode.OK)
+      assertThat(it.generatedAppGlideModuleContents())
+        .hasSourceEqualTo(appGlideModuleWithOnlyDependencyLibraryModules)
+    }
+  }
+
+  @Test
+  fun compile_withOnlyAppGlideModuleThroughBaseClass_generatesGeneratedAppGlideModule_thatCallsDependencyLibraryGlideModules() {
+    val kotlinAppModule =
+      KotlinSourceFile(
+        "AppModule.kt",
+        """
+        import com.bumptech.glide.annotation.GlideModule
+        import com.bumptech.glide.module.AppGlideModule
+
+        class BaseAppModule : AppGlideModule()
+        @GlideModule class AppModule : BaseAppModule()
+        """,
+      )
+    val javaBaseAppModule =
+      JavaSourceFile(
+        "BaseAppModule.java",
+        """
+        import com.bumptech.glide.module.AppGlideModule;
+
+        public class BaseAppModule extends AppGlideModule {
+          public BaseAppModule() {}
+        }
+        """,
+      )
+    val javaAppModule =
+      JavaSourceFile(
+        "AppModule.java",
+        """
+        import com.bumptech.glide.annotation.GlideModule;
+
+        @GlideModule public class AppModule extends BaseAppModule {
+          public AppModule() {}
+        }
+        """,
+      )
+
+    compileCurrentSourceType(kotlinAppModule, javaBaseAppModule, javaAppModule) {
       assertThat(it.exitCode).isEqualTo(ExitCode.OK)
       assertThat(it.generatedAppGlideModuleContents())
         .hasSourceEqualTo(appGlideModuleWithOnlyDependencyLibraryModules)
@@ -66,7 +108,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         import com.bumptech.glide.module.LibraryGlideModule
 
         @GlideModule class LibraryModule : LibraryGlideModule()
-        """
+        """,
       )
     val kotlinAppModule =
       KotlinSourceFile(
@@ -76,7 +118,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         import com.bumptech.glide.module.AppGlideModule
 
         @GlideModule class AppModule : AppGlideModule()
-        """
+        """,
       )
     val javaLibraryModule =
       JavaSourceFile(
@@ -86,7 +128,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
           import com.bumptech.glide.module.LibraryGlideModule;
           
           @GlideModule public class LibraryModule extends LibraryGlideModule {}
-        """
+        """,
       )
     val javaAppModule =
       JavaSourceFile(
@@ -98,14 +140,93 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
           @GlideModule public class AppModule extends AppGlideModule {
             public AppModule() {}
           }
-        """
+        """,
       )
 
     compileCurrentSourceType(
       kotlinAppModule,
       kotlinLibraryModule,
       javaAppModule,
-      javaLibraryModule
+      javaLibraryModule,
+    ) {
+      assertThat(it.exitCode).isEqualTo(ExitCode.OK)
+      assertThat(it.generatedAppGlideModuleContents())
+        .hasSourceEqualTo(appGlideModuleWithLibraryModuleAndDependencyLibraryModules)
+    }
+  }
+
+  @Test
+  fun compile_withValidLibraryGlideModule_andAppGlideModule_ThroughBaseClass_generatesGeneratedAppGlideModule_thatCallsAllLibraryAndDependencyAndAppGlideModules() {
+    val kotlinLibraryModule =
+      KotlinSourceFile(
+        "LibraryModule.kt",
+        """
+        import com.bumptech.glide.annotation.GlideModule
+        import com.bumptech.glide.module.LibraryGlideModule
+
+        class BaseLibraryModule : LibraryGlideModule()
+        @GlideModule class LibraryModule : BaseLibraryModule()
+        """,
+      )
+    val kotlinAppModule =
+      KotlinSourceFile(
+        "AppModule.kt",
+        """
+        import com.bumptech.glide.annotation.GlideModule
+        import com.bumptech.glide.module.AppGlideModule
+
+        class BaseAppModule : AppGlideModule()
+        @GlideModule class AppModule : BaseAppModule()
+        """,
+      )
+    val javaBaseLibraryModule =
+      JavaSourceFile(
+        "BaseLibraryModule.java",
+        """
+          import com.bumptech.glide.module.LibraryGlideModule;
+
+          public class BaseLibraryModule extends LibraryGlideModule {}
+        """,
+      )
+    val javaLibraryModule =
+      JavaSourceFile(
+        "LibraryModule.java",
+        """
+          import com.bumptech.glide.annotation.GlideModule;
+
+          @GlideModule public class LibraryModule extends BaseLibraryModule {}
+        """,
+      )
+    val javaBaseAppModule =
+      JavaSourceFile(
+        "BaseAppModule.java",
+        """
+          import com.bumptech.glide.module.AppGlideModule;
+
+          public class BaseAppModule extends AppGlideModule {
+            public BaseAppModule() {}
+          }
+        """,
+      )
+    val javaAppModule =
+      JavaSourceFile(
+        "AppModule.java",
+        """
+          import com.bumptech.glide.annotation.GlideModule;
+
+          @GlideModule public class AppModule extends BaseAppModule {
+            public AppModule() {}
+          }
+        """,
+      )
+
+    compileCurrentSourceType(
+      kotlinAppModule,
+      kotlinLibraryModule,
+      javaBaseAppModule,
+      javaAppModule,
+      javaBaseLibraryModule,
+      javaLibraryModule,
     ) {
       assertThat(it.exitCode).isEqualTo(ExitCode.OK)
       assertThat(it.generatedAppGlideModuleContents())
@@ -126,7 +247,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
 
         @Excludes(OkHttpLibraryGlideModule::class) 
         @GlideModule class AppModule : AppGlideModule()
-        """
+        """,
       )
     val javaAppModule =
       JavaSourceFile(
@@ -142,13 +263,10 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
           public class AppModule extends AppGlideModule {
             public AppModule() {}
           }
-        """
+        """,
       )
 
-    compileCurrentSourceType(
-      kotlinAppModule,
-      javaAppModule,
-    ) {
+    compileCurrentSourceType(kotlinAppModule, javaAppModule) {
       assertThat(it.exitCode).isEqualTo(ExitCode.OK)
       assertThat(it.generatedAppGlideModuleContents())
         .hasSourceEqualTo(CommonSources.simpleAppGlideModule)
@@ -165,7 +283,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         import com.bumptech.glide.module.LibraryGlideModule
 
         @GlideModule class ExcludedLibraryModule : LibraryGlideModule()
-        """
+        """,
       )
     val kotlinAppModule =
       KotlinSourceFile(
@@ -178,7 +296,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         @GlideModule 
         @Excludes(ExcludedLibraryModule::class) 
         class AppModule : AppGlideModule()
-        """
+        """,
       )
 
     val javaExcludedLibraryModule =
@@ -190,7 +308,7 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         
         @GlideModule
         public class ExcludedLibraryModule extends LibraryGlideModule {}
-        """
+        """,
       )
     val javaAppModule =
       JavaSourceFile(
@@ -205,13 +323,13 @@ class IntegrationLibraryGlideModuleTests(override val sourceType: SourceType) : 
         public class AppModule extends AppGlideModule {
           public AppModule() {}
         }
-        """
+        """,
       )
     compileCurrentSourceType(
       kotlinAppModule,
       kotlinExcludedLibraryModule,
       javaAppModule,
-      javaExcludedLibraryModule
+      javaExcludedLibraryModule,
     ) {
       assertThat(it.generatedAppGlideModuleContents())
         .hasSourceEqualTo(appGlideModuleWithOnlyDependencyLibraryModules)

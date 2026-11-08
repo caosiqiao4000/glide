@@ -12,6 +12,8 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.annotation.VisibleForTesting;
+import com.bumptech.glide.GlideBuilder;
+import com.bumptech.glide.GlideExperiments;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.ImageHeaderParser;
 import com.bumptech.glide.load.ImageHeaderParser.ImageType;
@@ -19,6 +21,7 @@ import com.bumptech.glide.load.Option;
 import com.bumptech.glide.load.Options;
 import com.bumptech.glide.load.PreferredColorSpace;
 import com.bumptech.glide.load.data.ParcelFileDescriptorRewinder;
+import com.bumptech.glide.load.engine.Engine;
 import com.bumptech.glide.load.engine.Resource;
 import com.bumptech.glide.load.engine.bitmap_recycle.ArrayPool;
 import com.bumptech.glide.load.engine.bitmap_recycle.BitmapPool;
@@ -65,6 +68,7 @@ public final class Downsampler {
    */
   public static final Option<PreferredColorSpace> PREFERRED_COLOR_SPACE =
       Option.memory("com.bumptech.glide.load.resource.bitmap.Downsampler.PreferredColorSpace");
+
   /**
    * Indicates the {@link com.bumptech.glide.load.resource.bitmap.DownsampleStrategy} option that
    * will be used to calculate the sample size to use to downsample an image given the original and
@@ -74,6 +78,7 @@ public final class Downsampler {
    */
   @Deprecated
   public static final Option<DownsampleStrategy> DOWNSAMPLE_STRATEGY = DownsampleStrategy.OPTION;
+
   /**
    * Ensure that the size of the bitmap is fixed to the requested width and height of the resource
    * from the caller. The final resource dimensions may differ from the requested width and height,
@@ -110,6 +115,31 @@ public final class Downsampler {
       Option.memory(
           "com.bumptech.glide.load.resource.bitmap.Downsampler.AllowHardwareDecode", false);
 
+  /**
+   * Indicates that we should bypass applying transformations when the decoded bitmap config is
+   * {@link Bitmap.Config#HARDWARE}.
+   *
+   * <p>Enabling this option avoids copying hardware bitmaps to software canvases for
+   * transformations (like center-cropping or rounding), which reduces memory usage and avoids
+   * crashes caused by software rendering of hardware bitmaps.
+   *
+   * <p>Tradeoffs: Enabled transformations will NOT be applied to the resulting bitmap. This is only
+   * safe for display-only layouts (like grids) where the target {@link android.widget.ImageView}
+   * can handle the scaling/cropping using its {@link android.widget.ImageView.ScaleType} (e.g.,
+   * {@link android.widget.ImageView.ScaleType#CENTER_CROP}).
+   *
+   * <p>This option is ignored unless {@link #ALLOW_HARDWARE_CONFIG} is also enabled.
+   */
+  public static final Option<Boolean> BYPASS_TRANSFORMATIONS_FOR_HARDWARE_BITMAPS =
+      Option.memory(
+          "com.bumptech.glide.load.resource.bitmap.Downsampler.BypassTransformationsForHardwareBitmaps",
+          false);
+
+  /** Indicates whether the image has an EXIF orientation requiring rotation. */
+  public static final Option<Boolean> IS_EXIF_ORIENTATION_REQUIRED =
+      Option.memory(
+          "com.bumptech.glide.load.resource.bitmap.Downsampler.IsExifOrientationRequired", false);
+
   private static final String WBMP_MIME_TYPE = "image/vnd.wap.wbmp";
   private static final String ICO_MIME_TYPE = "image/x-ico";
   private static final Set<String> NO_DOWNSAMPLE_PRE_N_MIME_TYPES =
@@ -139,16 +169,27 @@ public final class Downsampler {
   private final ArrayPool byteArrayPool;
   private final List<ImageHeaderParser> parsers;
   private final HardwareConfigState hardwareConfigState = HardwareConfigState.getInstance();
+  private final GlideExperiments experiments;
 
   public Downsampler(
       List<ImageHeaderParser> parsers,
       DisplayMetrics displayMetrics,
       BitmapPool bitmapPool,
       ArrayPool byteArrayPool) {
+    this(parsers, displayMetrics, bitmapPool, byteArrayPool, null);
+  }
+
+  public Downsampler(
+      List<ImageHeaderParser> parsers,
+      DisplayMetrics displayMetrics,
+      BitmapPool bitmapPool,
+      ArrayPool byteArrayPool,
+      @Nullable GlideExperiments experiments) {
     this.parsers = parsers;
     this.displayMetrics = Preconditions.checkNotNull(displayMetrics);
     this.bitmapPool = Preconditions.checkNotNull(bitmapPool);
     this.byteArrayPool = Preconditions.checkNotNull(byteArrayPool);
+    this.experiments = experiments;
   }
 
   public boolean handles(@SuppressWarnings("unused") InputStream is) {
@@ -184,8 +225,10 @@ public final class Downsampler {
   public Resource<Bitmap> decode(
       ByteBuffer buffer, int requestedWidth, int requestedHeight, Options options)
       throws IOException {
+    boolean enableDirectByteBufferDecoding = false;
     return decode(
-        new ImageReader.ByteBufferReader(buffer, parsers, byteArrayPool),
+        new ImageReader.ByteBufferReader(
+            buffer, parsers, byteArrayPool, enableDirectByteBufferDecoding),
         requestedWidth,
         requestedHeight,
         options,
@@ -409,7 +452,7 @@ public final class Downsampler {
       // If this isn't an image, or BitmapFactory was unable to parse the size, width and height
       // will be -1 here.
       if (expectedWidth > 0 && expectedHeight > 0) {
-        setInBitmap(options, bitmapPool, expectedWidth, expectedHeight);
+        setInBitmap(options, bitmapPool, expectedWidth, expectedHeight, experiments);
       }
     }
 
@@ -428,6 +471,12 @@ public final class Downsampler {
 
     Bitmap downsampled = decodeStream(imageReader, options, callbacks, bitmapPool);
     callbacks.onDecodeComplete(bitmapPool, downsampled);
+
+    if (downsampled != null && sourceWidth > 0 && sourceHeight > 0) {
+      if (Log.isLoggable(Engine.GLIDE_MEMORY_TRACKING_TAG, Log.DEBUG)) {
+        logMemoryTracking(downsampleStrategy, downsampled, sourceWidth, sourceHeight);
+      }
+    }
 
     if (Log.isLoggable(TAG, Log.VERBOSE)) {
       logDecode(
@@ -454,6 +503,20 @@ public final class Downsampler {
     }
 
     return rotated;
+  }
+
+  private static void logMemoryTracking(
+      DownsampleStrategy downsampleStrategy,
+      Bitmap downsampled,
+      int sourceWidth,
+      int sourceHeight) {
+    Util.logMemoryTracking(
+        Engine.GLIDE_MEMORY_TRACKING_TAG,
+        "Downsampler",
+        downsampleStrategy.getClass().getSimpleName(),
+        downsampled,
+        sourceWidth,
+        sourceHeight);
   }
 
   private static void calculateScaling(
@@ -899,7 +962,11 @@ public final class Downsampler {
   @SuppressWarnings("PMD.CollapsibleIfStatements")
   @TargetApi(Build.VERSION_CODES.O)
   private static void setInBitmap(
-      BitmapFactory.Options options, BitmapPool bitmapPool, int width, int height) {
+      BitmapFactory.Options options,
+      BitmapPool bitmapPool,
+      int width,
+      int height,
+      @Nullable GlideExperiments experiments) {
     @Nullable Bitmap.Config expectedConfig = null;
     // Avoid short circuiting, it appears to break on some devices.
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -909,6 +976,15 @@ public final class Downsampler {
       // On API 26 outConfig may be null for some images even if the image is valid, can be decoded
       // and outWidth/outHeight/outColorSpace are populated (see b/71513049).
       expectedConfig = options.outConfig;
+
+      // If we have a standard image (not wide gamut) and we're requesting RGB_565, avoid allocating
+      // more space than necessary.
+      if (expectedConfig == Config.ARGB_8888 && options.inPreferredConfig == Config.RGB_565) {
+        if (experiments != null
+            && experiments.isEnabled(GlideBuilder.EnableRgb565DownsamplerFix.class)) {
+          expectedConfig = Config.RGB_565;
+        }
+      }
     }
 
     if (expectedConfig == null) {

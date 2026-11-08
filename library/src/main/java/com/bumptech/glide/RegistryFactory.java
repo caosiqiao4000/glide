@@ -13,6 +13,8 @@ import android.os.ParcelFileDescriptor;
 import androidx.annotation.Nullable;
 import androidx.tracing.Trace;
 import com.bumptech.glide.GlideBuilder.EnableImageDecoderForBitmaps;
+import com.bumptech.glide.GlideBuilder.EnableUriImageDecoder;
+import com.bumptech.glide.GlideBuilder.UseMediaStoreOpenFileApisIfPossible;
 import com.bumptech.glide.gifdecoder.GifDecoder;
 import com.bumptech.glide.load.ImageHeaderParser;
 import com.bumptech.glide.load.ResourceDecoder;
@@ -55,6 +57,7 @@ import com.bumptech.glide.load.resource.bitmap.ParcelFileDescriptorBitmapDecoder
 import com.bumptech.glide.load.resource.bitmap.ResourceBitmapDecoder;
 import com.bumptech.glide.load.resource.bitmap.StreamBitmapDecoder;
 import com.bumptech.glide.load.resource.bitmap.UnitBitmapDecoder;
+import com.bumptech.glide.load.resource.bitmap.UriBitmapImageDecoderResourceDecoder;
 import com.bumptech.glide.load.resource.bitmap.VideoDecoder;
 import com.bumptech.glide.load.resource.bytes.ByteBufferRewinder;
 import com.bumptech.glide.load.resource.drawable.AnimatedImageDecoder;
@@ -153,16 +156,50 @@ final class RegistryFactory {
         VideoDecoder.parcel(bitmapPool);
 
     // TODO(judds): Make ParcelFileDescriptorBitmapDecoder work with ImageDecoder.
+    // Pass the experiments config to Downsampler so it can check active flags.
     Downsampler downsampler =
         new Downsampler(
-            registry.getImageHeaderParsers(), resources.getDisplayMetrics(), bitmapPool, arrayPool);
+            registry.getImageHeaderParsers(),
+            resources.getDisplayMetrics(),
+            bitmapPool,
+            arrayPool,
+            experiments);
 
     ResourceDecoder<ByteBuffer, Bitmap> byteBufferBitmapDecoder;
     ResourceDecoder<InputStream, Bitmap> streamBitmapDecoder;
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+    ResourceDecoder<Uri, Bitmap> uriBitmapDecoder = null;
+    ResourceDecoder<ByteBuffer, Bitmap> fallbackByteBufferBitmapDecoder = null;
+    ResourceDecoder<InputStream, Bitmap> fallbackStreamBitmapDecoder = null;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
         && experiments.isEnabled(EnableImageDecoderForBitmaps.class)) {
-      streamBitmapDecoder = new InputStreamBitmapImageDecoderResourceDecoder();
-      byteBufferBitmapDecoder = new ByteBufferBitmapImageDecoderResourceDecoder();
+      if (experiments.isEnabled(
+          GlideBuilder.UseBitmapFactoryForInputStreamsWithImageDecoder.class)) {
+        // ImageDecoder has no streaming Source, so decoding an InputStream with it requires
+        // copying the whole stream into memory. Decode streams with BitmapFactory instead and
+        // reserve ImageDecoder for File, ParcelFileDescriptor, Uri and ByteBuffer sources.
+        streamBitmapDecoder = new StreamBitmapDecoder(downsampler, arrayPool);
+      } else {
+        streamBitmapDecoder =
+            new InputStreamBitmapImageDecoderResourceDecoder(
+                imageHeaderParsers,
+                experiments.isEnabled(
+                    GlideBuilder.UseHeapBufferForImageDecoderWithInputStream.class),
+                arrayPool,
+                experiments.isEnabled(
+                    GlideBuilder.UseArrayPoolForImageDecoderByteBufferAllocation.class),
+                experiments.isEnabled(GlideBuilder.RespectExifOrientationInImageDecoder.class));
+        fallbackStreamBitmapDecoder = new StreamBitmapDecoder(downsampler, arrayPool);
+      }
+      byteBufferBitmapDecoder =
+          new ByteBufferBitmapImageDecoderResourceDecoder(
+              imageHeaderParsers,
+              arrayPool,
+              experiments.isEnabled(GlideBuilder.RespectExifOrientationInImageDecoder.class));
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
+          && experiments.isEnabled(EnableUriImageDecoder.class)) {
+        uriBitmapDecoder = new UriBitmapImageDecoderResourceDecoder(context);
+      }
+      fallbackByteBufferBitmapDecoder = new ByteBufferBitmapDecoder(downsampler);
     } else {
       byteBufferBitmapDecoder = new ByteBufferBitmapDecoder(downsampler);
       streamBitmapDecoder = new StreamBitmapDecoder(downsampler, arrayPool);
@@ -194,8 +231,21 @@ final class RegistryFactory {
         .append(ByteBuffer.class, new ByteBufferEncoder())
         .append(InputStream.class, new StreamEncoder(arrayPool))
         /* Bitmaps */
-        .append(Registry.BUCKET_BITMAP, ByteBuffer.class, Bitmap.class, byteBufferBitmapDecoder)
-        .append(Registry.BUCKET_BITMAP, InputStream.class, Bitmap.class, streamBitmapDecoder);
+        .append(Registry.BUCKET_BITMAP, ByteBuffer.class, Bitmap.class, byteBufferBitmapDecoder);
+    if (fallbackByteBufferBitmapDecoder != null) {
+      registry.append(
+          Registry.BUCKET_BITMAP, ByteBuffer.class, Bitmap.class, fallbackByteBufferBitmapDecoder);
+    }
+    registry.append(Registry.BUCKET_BITMAP, InputStream.class, Bitmap.class, streamBitmapDecoder);
+    if (fallbackStreamBitmapDecoder != null) {
+      registry.append(
+          Registry.BUCKET_BITMAP, InputStream.class, Bitmap.class, fallbackStreamBitmapDecoder);
+    }
+
+    if (uriBitmapDecoder != null) {
+      registry.prepend(Uri.class, Bitmap.class, uriBitmapDecoder);
+      registry.prepend(Uri.class, Uri.class, UnitModelLoader.Factory.<Uri>getInstance());
+    }
 
     if (ParcelFileDescriptorRewinder.isSupported()) {
       registry.append(
@@ -237,7 +287,16 @@ final class RegistryFactory {
             Registry.BUCKET_BITMAP_DRAWABLE,
             ParcelFileDescriptor.class,
             BitmapDrawable.class,
-            new BitmapDrawableDecoder<>(resources, parcelFileDescriptorVideoDecoder))
+            new BitmapDrawableDecoder<>(resources, parcelFileDescriptorVideoDecoder));
+
+    if (uriBitmapDecoder != null) {
+      registry.prepend(
+          Uri.class,
+          BitmapDrawable.class,
+          new BitmapDrawableDecoder<>(resources, uriBitmapDecoder));
+    }
+
+    registry
         .append(BitmapDrawable.class, new BitmapDrawableEncoder(bitmapPool, bitmapEncoder))
         /* GIFs */
         .append(
@@ -338,16 +397,23 @@ final class RegistryFactory {
           ParcelFileDescriptor.class,
           new QMediaStoreUriLoader.FileDescriptorFactory(context));
     }
+    boolean useMediaStoreOpenFileApisIfPossible =
+        experiments.isEnabled(UseMediaStoreOpenFileApisIfPossible.class);
     registry
-        .append(Uri.class, InputStream.class, new UriLoader.StreamFactory(contentResolver))
+        .append(
+            Uri.class,
+            InputStream.class,
+            new UriLoader.StreamFactory(contentResolver, useMediaStoreOpenFileApisIfPossible))
         .append(
             Uri.class,
             ParcelFileDescriptor.class,
-            new UriLoader.FileDescriptorFactory(contentResolver))
+            new UriLoader.FileDescriptorFactory(
+                contentResolver, useMediaStoreOpenFileApisIfPossible))
         .append(
             Uri.class,
             AssetFileDescriptor.class,
-            new UriLoader.AssetFileDescriptorFactory(contentResolver))
+            new UriLoader.AssetFileDescriptorFactory(
+                contentResolver, useMediaStoreOpenFileApisIfPossible))
         .append(Uri.class, InputStream.class, new UrlUriLoader.StreamFactory())
         .append(URL.class, InputStream.class, new UrlLoader.StreamFactory())
         .append(Uri.class, File.class, new MediaStoreFileLoader.Factory(context))

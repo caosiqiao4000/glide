@@ -13,24 +13,19 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import android.app.Activity;
-import android.content.Context;
 import android.graphics.drawable.Drawable;
-import android.os.Build;
-import android.view.Display;
+import android.os.Bundle;
 import android.view.View;
 import android.view.View.OnAttachStateChangeListener;
 import android.view.ViewGroup;
 import android.view.ViewGroup.LayoutParams;
 import android.view.ViewTreeObserver;
-import android.view.WindowManager;
 import android.widget.FrameLayout;
-import android.widget.LinearLayout;
+import android.widget.ImageView;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.test.core.app.ApplicationProvider;
 import com.bumptech.glide.request.Request;
 import com.bumptech.glide.request.transition.Transition;
-import com.bumptech.glide.util.Preconditions;
 import com.google.common.truth.Truth;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.After;
@@ -42,10 +37,9 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 import org.robolectric.Robolectric;
 import org.robolectric.RobolectricTestRunner;
-import org.robolectric.Shadows;
 import org.robolectric.android.controller.ActivityController;
 import org.robolectric.annotation.Config;
-import org.robolectric.util.ReflectionHelpers;
+import org.robolectric.shadows.ShadowLooper;
 
 /**
  * Test for {@link CustomViewTarget}.
@@ -55,44 +49,48 @@ import org.robolectric.util.ReflectionHelpers;
  * gradle changes, but I've so far failed to figure out the right set of commands.
  */
 @RunWith(RobolectricTestRunner.class)
-@Config(sdk = 19, manifest = "build/intermediates/manifests/full/debug/AndroidManifest.xml")
+@Config(sdk = Config.OLDEST_SDK)
 public class CustomViewTargetTest {
-  private ActivityController<Activity> activity;
   private View view;
   private ViewGroup parent;
   private CustomViewTarget<View, Object> target;
   @Mock private SizeReadyCallback cb;
   @Mock private Request request;
-  private int sdkVersion;
   private AttachStateTarget attachStateTarget;
+
+  public static final class TestActivity extends Activity {
+    ViewGroup parent;
+
+    @Override
+    protected void onCreate(@Nullable Bundle savedInstanceState) {
+      super.onCreate(savedInstanceState);
+      parent = new FrameLayout(this);
+      setContentView(parent);
+    }
+  }
 
   @Before
   public void setUp() {
-    sdkVersion = Build.VERSION.SDK_INT;
     MockitoAnnotations.initMocks(this);
-    activity = Robolectric.buildActivity(Activity.class).create().start().postCreate(null).resume();
-    view = new View(activity.get());
+    ActivityController<TestActivity> activityController =
+        Robolectric.buildActivity(TestActivity.class).setup();
+    TestActivity activity = activityController.get();
+    parent = activity.parent;
+    view = new ImageView(activity);
     target = new TestViewTarget(view);
     attachStateTarget = new AttachStateTarget(view);
+  }
 
-    LinearLayout linearLayout = new LinearLayout(activity.get());
-    View expandView = new View(activity.get());
-    LinearLayout.LayoutParams linearLayoutParams =
-        new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, /* height= */ 0);
-    linearLayoutParams.weight = 1f;
-    expandView.setLayoutParams(linearLayoutParams);
-    linearLayout.addView(expandView);
-
-    parent = new FrameLayout(activity.get());
-    parent.addView(view);
-    linearLayout.addView(parent);
-
-    activity.get().setContentView(linearLayout);
+  private void attachAndLayoutView() {
+    if (view.getParent() == null) {
+      parent.addView(view);
+    }
+    parent.requestLayout();
+    ShadowLooper.idleMainLooper();
   }
 
   @After
   public void tearDown() {
-    setSdkVersionInt(sdkVersion);
     CustomViewTarget.SizeDeterminer.maxDisplayLength = null;
   }
 
@@ -125,7 +123,6 @@ public class CustomViewTargetTest {
   @Test
   public void testSizeCallbackIsCalledSynchronouslyIfViewSizeSet() {
     int dimens = 333;
-    // activity.get().setContentView(view);
     view.layout(0, 0, dimens, dimens);
 
     target.getSize(cb);
@@ -145,60 +142,54 @@ public class CustomViewTargetTest {
     verify(cb).onSizeReady(eq(dimens), eq(dimens));
   }
 
+  @Config(qualifiers = "w200dp-h300dp")
   @Test
   public void getSize_withBothWrapContent_usesDisplayDimens() {
     LayoutParams layoutParams =
         new FrameLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
     view.setLayoutParams(layoutParams);
 
-    setDisplayDimens(200, 300);
-
-    activity.visible();
-    view.layout(0, 0, 0, 0);
+    attachAndLayoutView();
 
     target.getSize(cb);
 
     verify(cb).onSizeReady(300, 300);
   }
 
+  @Config(qualifiers = "w100dp-h200dp")
   @Test
   public void getSize_withWrapContentWidthAndValidHeight_usesDisplayDimenAndValidHeight() {
     int height = 100;
     LayoutParams params = new FrameLayout.LayoutParams(LayoutParams.WRAP_CONTENT, height);
     view.setLayoutParams(params);
 
-    setDisplayDimens(100, 200);
-
-    activity.visible();
-    view.setRight(0);
+    attachAndLayoutView();
 
     target.getSize(cb);
 
     verify(cb).onSizeReady(200, height);
   }
 
+  @Config(qualifiers = "w200dp-h100dp")
   @Test
   public void getSize_withWrapContentHeightAndValidWidth_returnsWidthAndDisplayDimen() {
     int width = 100;
     LayoutParams params = new FrameLayout.LayoutParams(width, LayoutParams.WRAP_CONTENT);
     view.setLayoutParams(params);
-    setDisplayDimens(200, 100);
-    parent.getLayoutParams().height = 200;
 
-    activity.visible();
+    attachAndLayoutView();
 
     target.getSize(cb);
 
     verify(cb).onSizeReady(width, 200);
   }
 
+  @Config(qualifiers = "w500dp-h600dp")
   @Test
   public void getSize_withWrapContentWidthAndMatchParentHeight_usesDisplayDimenWidthAndHeight() {
     LayoutParams params =
         new FrameLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.MATCH_PARENT);
     view.setLayoutParams(params);
-
-    setDisplayDimens(500, 600);
 
     target.getSize(cb);
 
@@ -206,31 +197,30 @@ public class CustomViewTargetTest {
 
     int height = 32;
     parent.getLayoutParams().height = height;
-    activity.visible();
+    attachAndLayoutView();
 
     view.getViewTreeObserver().dispatchOnPreDraw();
 
-    verify(cb).onSizeReady(500, height);
+    verify(cb).onSizeReady(600, height);
   }
 
+  @Config(qualifiers = "w300dp-h400dp")
   @Test
   public void getSize_withMatchParentWidthAndWrapContentHeight_usesWidthAndDisplayDimenHeight() {
     LayoutParams params =
         new FrameLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
     view.setLayoutParams(params);
 
-    setDisplayDimens(300, 400);
-
     target.getSize(cb);
 
     verify(cb, never()).onSizeReady(anyInt(), anyInt());
 
     int width = 32;
-    parent.getLayoutParams().width = 32;
-    activity.visible();
+    parent.getLayoutParams().width = width;
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
-    verify(cb).onSizeReady(width, 352);
+    verify(cb).onSizeReady(width, 400);
   }
 
   @Test
@@ -243,7 +233,7 @@ public class CustomViewTargetTest {
 
     verify(cb, never()).onSizeReady(anyInt(), anyInt());
 
-    activity.visible();
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
     verify(cb).onSizeReady(eq(parent.getWidth()), eq(parent.getHeight()));
@@ -257,7 +247,7 @@ public class CustomViewTargetTest {
     int height = 32;
     parent.getLayoutParams().width = width;
     parent.getLayoutParams().height = height;
-    activity.visible();
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
     verify(cb).onSizeReady(eq(width), eq(height));
@@ -275,7 +265,7 @@ public class CustomViewTargetTest {
     int height = 111;
     parent.getLayoutParams().width = width;
     parent.getLayoutParams().height = height;
-    activity.visible();
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
     InOrder order = inOrder((Object[]) cbs);
@@ -290,7 +280,7 @@ public class CustomViewTargetTest {
     target.getSize(cb);
 
     view.setLayoutParams(new FrameLayout.LayoutParams(100, 100));
-    activity.visible();
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
     verify(cb, times(1)).onSizeReady(anyInt(), anyInt());
@@ -312,7 +302,7 @@ public class CustomViewTargetTest {
     target.getSize(cb1);
 
     view.setLayoutParams(new FrameLayout.LayoutParams(100, 100));
-    activity.visible();
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
     SizeReadyCallback cb2 = mock(SizeReadyCallback.class);
@@ -333,7 +323,12 @@ public class CustomViewTargetTest {
 
     verify(cb, never()).onSizeReady(anyInt(), anyInt());
 
-    activity.visible();
+    parent.getLayoutParams().width = 100;
+    parent.getLayoutParams().height = 100;
+    view.setLayoutParams(
+        new FrameLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+    attachAndLayoutView();
+    view.getViewTreeObserver().dispatchOnPreDraw();
     verify(cb).onSizeReady(anyInt(), anyInt());
   }
 
@@ -353,7 +348,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void testCallbackIsNotCalledTwiceIfPreDrawFiresTwice() {
-    activity.visible();
+    attachAndLayoutView();
     target.getSize(cb);
 
     LayoutParams layoutParams = new FrameLayout.LayoutParams(1234, 4123);
@@ -376,7 +371,7 @@ public class CustomViewTargetTest {
     int height = 875;
     LayoutParams layoutParams = new FrameLayout.LayoutParams(width, height);
     view.setLayoutParams(layoutParams);
-    activity.visible();
+    attachAndLayoutView();
     view.getViewTreeObserver().dispatchOnPreDraw();
     view.getViewTreeObserver().dispatchOnPreDraw();
 
@@ -394,7 +389,7 @@ public class CustomViewTargetTest {
     view.setLayoutParams(layoutParams);
     ViewTreeObserver vto = view.getViewTreeObserver();
     view.requestLayout();
-    activity.visible();
+    attachAndLayoutView();
     assertFalse(vto.isAlive());
     vto.dispatchOnPreDraw();
 
@@ -408,7 +403,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void testDecreasesDimensionsByViewPadding() {
-    activity.visible();
+    attachAndLayoutView();
     view.setLayoutParams(new FrameLayout.LayoutParams(100, 100));
     view.setPadding(25, 25, 25, 25);
     view.requestLayout();
@@ -449,7 +444,6 @@ public class CustomViewTargetTest {
 
   @Test
   public void getSize_withValidWidthAndHeight_preV19_layoutRequested_callsSizeReady() {
-    setSdkVersionInt(18);
     view.setLayoutParams(new FrameLayout.LayoutParams(100, 100));
     view.requestLayout();
 
@@ -469,32 +463,18 @@ public class CustomViewTargetTest {
     verify(cb, never()).onSizeReady(anyInt(), anyInt());
   }
 
-  private void setDisplayDimens(Integer width, Integer height) {
-    WindowManager windowManager =
-        (WindowManager)
-            ApplicationProvider.getApplicationContext().getSystemService(Context.WINDOW_SERVICE);
-    Display display = Preconditions.checkNotNull(windowManager).getDefaultDisplay();
-    if (width != null) {
-      Shadows.shadowOf(display).setWidth(width);
-    }
-
-    if (height != null) {
-      Shadows.shadowOf(display).setHeight(height);
-    }
-  }
-
   @Test
   public void clearOnDetach_onDetach_withNullRequest_doesNothing() {
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(null);
-    activity.visible();
+    attachAndLayoutView();
   }
 
   // This behavior isn't clearly correct, but it doesn't seem like there's any harm to clear an
   // already cleared request, so we might as well avoid the extra check/complexity in the code.
   @Test
   public void clearOnDetach_onDetach_withClearedRequest_clearsRequest() {
-    activity.visible();
+    attachAndLayoutView();
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(request);
     when(request.isCleared()).thenReturn(true);
@@ -505,7 +485,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void clearOnDetach_onDetach_withRunningRequest_pausesRequestOnce() {
-    activity.visible();
+    attachAndLayoutView();
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(request);
     parent.removeView(view);
@@ -515,7 +495,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void clearOnDetach_onDetach_afterOnLoadCleared_removesListener() {
-    activity.visible();
+    attachAndLayoutView();
     attachStateTarget.clearOnDetach();
     attachStateTarget.onLoadCleared(/* placeholder= */ null);
     attachStateTarget.setRequest(request);
@@ -526,7 +506,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void clearOnDetach_moreThanOnce_registersObserverOnce() {
-    activity.visible();
+    attachAndLayoutView();
     attachStateTarget.setRequest(request);
     attachStateTarget.clearOnDetach().clearOnDetach();
     parent.removeView(view);
@@ -536,7 +516,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void clearOnDetach_onDetach_afterMultipleClearOnDetaches_removesListener() {
-    activity.visible();
+    attachAndLayoutView();
     attachStateTarget.clearOnDetach().clearOnDetach().clearOnDetach();
     attachStateTarget.onLoadCleared(/* placeholder= */ null);
     attachStateTarget.setRequest(request);
@@ -547,7 +527,7 @@ public class CustomViewTargetTest {
 
   @Test
   public void clearOnDetach_onDetach_afterLoadCleared_clearsRequest() {
-    activity.visible();
+    attachAndLayoutView();
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(request);
     when(request.isCleared()).thenReturn(true);
@@ -560,7 +540,7 @@ public class CustomViewTargetTest {
   public void clearOnDetach_onAttach_withNullRequest_doesNothing() {
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(null);
-    activity.visible();
+    attachAndLayoutView();
   }
 
   @Test
@@ -568,7 +548,7 @@ public class CustomViewTargetTest {
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(request);
     when(request.isCleared()).thenReturn(false);
-    activity.visible();
+    attachAndLayoutView();
 
     verify(request, never()).begin();
   }
@@ -578,7 +558,7 @@ public class CustomViewTargetTest {
     attachStateTarget.clearOnDetach();
     attachStateTarget.setRequest(request);
     when(request.isCleared()).thenReturn(true);
-    activity.visible();
+    attachAndLayoutView();
 
     verify(request).begin();
   }
@@ -590,7 +570,7 @@ public class CustomViewTargetTest {
     when(request.isCleared()).thenReturn(true);
     attachStateTarget.onLoadCleared(/* placeholder= */ null);
     attachStateTarget.onLoadStarted(/* placeholder= */ null);
-    activity.visible();
+    attachAndLayoutView();
 
     verify(request).begin();
   }
@@ -601,14 +581,14 @@ public class CustomViewTargetTest {
     attachStateTarget.setRequest(request);
     when(request.isCleared()).thenReturn(true);
     attachStateTarget.onLoadCleared(/* placeholder= */ null);
-    activity.visible();
+    attachAndLayoutView();
 
     verify(request, never()).begin();
   }
 
   @Test
   public void onLoadStarted_withoutClearOnDetach_doesNotAddListener() {
-    activity.visible();
+    attachAndLayoutView();
     target.setRequest(request);
     attachStateTarget.onLoadStarted(/* placeholder= */ null);
     parent.removeView(view);
@@ -635,7 +615,7 @@ public class CustomViewTargetTest {
 
     attachStateTarget.onLoadCleared(/* placeholder= */ null);
 
-    activity.visible();
+    attachAndLayoutView();
 
     Truth.assertThat(count.get()).isEqualTo(1);
   }
@@ -694,9 +674,5 @@ public class CustomViewTargetTest {
     public void onLoadFailed(@Nullable Drawable errorDrawable) {
       // Avoid calling super.
     }
-  }
-
-  private static void setSdkVersionInt(int version) {
-    ReflectionHelpers.setStaticField(Build.VERSION.class, "SDK_INT", version);
   }
 }
